@@ -9,6 +9,25 @@ import time
 
 import pandas as pd
 
+DTYPE_JOB_STATES = pd.CategoricalDtype(
+    [
+        'FAILED',
+        'TIMEOUT',
+        'DEADLINE',
+        'OUT_OF_MEMORY',
+        'BOOT_FAIL',
+        'NODE_FAIL',
+        'CANCELLED',
+        'PREEMPTED',
+        'SUSPENDED',
+        'RUNNING',
+        'PENDING',
+        'COMPLETED'
+    ],
+    ordered=True
+)
+FAILURE_STATES = ('FAILED', 'TIMEOUT', 'DEADLINE', 'OUT_OF_MEMORY', 'BOOT_FAIL', 'NODE_FAIL', 'CANCELLED')
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Run Umap on a genome.')
     parser.add_argument(
@@ -41,10 +60,60 @@ def parse_args():
     return parser.parse_args()
 
 
+def preprocess_dependencies(
+    dependencies: list[str | int | None],
+    jobname: str = "",
+    verbose: bool = True,
+    wait: bool = True
+) -> list[str]:
+    """
+    Preprocess job dependencies to remove None values and convert to strings.
+    1. If any of the dependencies failed, raise an error.
+    2. If any of the dependencies are not found, wait JobAcctGatherFrequency seconds. If they are still not found,
+       raise a ValueError.
+    3. If any of the dependencies are completed, remove them from the list.
+
+    Args
+    - dependencies: List of job IDs to check.
+    - jobname: Name of the job being submitted.
+    - verbose: Whether to print the full submission command to standard error.
+    - wait: Whether to wait for JobAcctGatherFrequency seconds before checking for missing dependencies.
+
+    Returns: List of job IDs that are still pending or running.
+    """
+    dependencies = [str(jobid) for jobid in dependencies if jobid is not None]
+    # Instead of directly passing these Job IDs to sbatch --dependency, we preprocess them first.
+    # This prevents job submission failure if those jobs finished more than MinJobAge seconds ago.
+    # See sbatch documententation. Use scontrol show config | grep MinJobAge to get the MinJobAge
+    # SLURM configuration parameter value.
+    if len(dependencies) == 0:
+        return []
+    states = get_job_state(dependencies, collapse_arrays_and_steps=True)
+    if any(state in FAILURE_STATES for state in states.values()):
+        raise ValueError(f"One or more dependencies failed: {states}")
+
+    # If any dependencies are not found by sacct, wait JobAcctGatherFrequency seconds and check again.
+    for jobid in dependencies.copy():
+        if jobid not in states:
+            if wait is True:
+                JobAcctGatherFrequency = int(get_slurm_config()['JobAcctGatherFrequency'])
+                time.sleep(JobAcctGatherFrequency)
+                return preprocess_dependencies(dependencies, jobname=jobname, verbose=verbose, wait=False)
+            raise ValueError(f"Trying to submit job {jobname}: dependency {jobid} not found in SLURM job status.")
+
+    if verbose:
+        print(f"Trying to submit job {jobname}: dependency states =", states, file=sys.stderr, flush=True)
+
+    for jobid in dependencies.copy():
+        if states[jobid] == 'COMPLETED':
+            dependencies.remove(jobid)
+    return dependencies
+
+
 def submit_job(
     *args,
     submit_command: str = "sbatch",
-    dependencies: list[int] | None = None,
+    dependencies: list[str | int | None] | None = None,
     jobname: str = "",
     export: str = "",
     array: str = "",
@@ -59,10 +128,11 @@ def submit_job(
     Submit SLURM job and return job ID.
 
     Args
-    - *args: Arguments to pass to sbatch/srun.
+    - *args: program and arguments to run.
     - submit_command: Command to submit the job ("sbatch" or "srun").
     - dependencies: List of job IDs that this job depends on.
-    - verbose: Whether to print the full sbatch command to standard error.
+    - jobname, export, array, c, time, mem, output, error: SLURM job parameters.
+    - verbose: Whether to print the full submission command to standard error.
     """
     assert submit_command in ["sbatch", "srun"], f"submit_command {submit_command} not 'sbatch' or 'srun'."
     command = [
@@ -84,10 +154,10 @@ def submit_job(
         command.append(f"--output={output}")
     if error != "":
         command.append(f"--error={error}")
-    if dependencies:
-        dependencies = [jobid for jobid in dependencies if jobid is not None]
+    if dependencies is not None:
+        dependencies = preprocess_dependencies(dependencies, jobname=jobname, verbose=verbose)
         if len(dependencies) > 0:
-            command.append("--dependency=afterok:" + ",".join(map(str, dependencies)))
+            command.append("--dependency=afterok:" + ",".join(dependencies))
 
     command.extend(args)
     if verbose:
@@ -110,21 +180,45 @@ def submit_job(
         raise
 
 
-def get_job_status(jobids: list[int]) -> dict[int, str]:
+def get_job_state(
+    jobids: list[str] | None = None,
+    user: str | None = os.environ['USER'],
+    collapse_arrays_and_steps: bool = False
+) -> dict[str, str]:
     """
     Get the status of SLURM jobs.
+
+    Args:
+    - jobids: List of job IDs to check.
+    - user: User name to check for running jobs. If None, does not filter by user.
+    - collapse_arrays_and_steps: If True, collapse arrays and steps into a single job ID.
 
     Returns: dictionary mapping job IDs to their status.
     - If a requested job ID is not found, it will not be included in the output.
     """
-    command = ["sacct", "-j", ','.join(map(str, jobids)), "--parsable2"]
+    command = ["sacct", "--parsable2"]
+    if jobids is not None:
+        command.extend(["-j", ','.join(jobids)])
+    if user is not None:
+        command.extend(["-u", user])
     result = subprocess.run(command, capture_output=True, text=True, check=True)
     df_status = pd.read_csv(io.StringIO(result.stdout), sep='|', header=0).astype(dict(JobID=str))
-    df_status = df_status.loc[~df_status['JobID'].str.endswith(('.batch', '.extern'))]
-    return df_status.set_index('JobID')['State'].to_dict()
+    df_status = df_status.loc[~df_status['JobID'].str.endswith(('.batch', '.extern'))].copy()
+    df_status['JobID_base'] = df_status['JobID'].str.extract(r'^(\d+)', expand=False)
+    if collapse_arrays_and_steps:
+        return (
+            df_status
+            .astype(dict(State=DTYPE_JOB_STATES))
+            .sort_values(['JobID_base', 'State'])
+            .groupby('JobID_base')['State']
+            .first()
+            .to_dict()
+        )
+    else:
+        return df_status.set_index('JobID')['State'].to_dict()
 
 
-def wait_to_submit(max_jobs: int = 1000, max_wait: int = 1200, user: str | None = None):
+def wait_to_submit(max_jobs: int = 1000, max_wait: int = 1200, user: str | None = None) -> None:
     """
     Wait until the number of running jobs is less than max_jobs.
 
@@ -149,17 +243,18 @@ def wait_to_submit(max_jobs: int = 1000, max_wait: int = 1200, user: str | None 
         time.sleep(20)
 
 
-def get_max_array_size() -> int:
+def get_slurm_config() -> dict[str, str]:
     """
-    Get the maximum job array size allowed by the SLURM system.
-
-    Run scontrol show config and parse the output for the MaxArraySize parameter.
+    Get SLURM configuration parameters via scontrol show config.
     """
     result = subprocess.run(["scontrol", "show", "config"], capture_output=True, text=True, check=True)
+    regex_option = re.compile(r'^(?P<key>\S+)\s+=\s+(?P<value>.*)$')
+    config = dict()
     for line in result.stdout.splitlines():
-        if line.startswith("MaxArraySize"):
-            return int(line.split('=')[1].strip())
-    raise ValueError("MaxArraySize not found in scontrol output.")
+        match = regex_option.match(line.rstrip())
+        if match:
+            config[match.group('key')] = match.group('value')
+    return config
 
 
 def main():
@@ -288,6 +383,7 @@ def main():
             str(path_genome_fasta_renamed),
             str(prefix_bowtie_index),
             jobname="bowtie_index",
+            submit_command="srun",
             dependencies=[jobids.get('rename_chroms')],
             time="12:00:00",
             mem="32G",
@@ -318,7 +414,8 @@ def main():
     df_segment_indices = pd.read_csv(path_segment_indices, sep='\t', header=0)
     n_chroms = len(df_segment_indices['Chromosome'].unique())
     n_segments = len(df_segment_indices)
-    max_array_size = get_max_array_size() - 1
+    SLURM_CONFIG = get_slurm_config()
+    max_array_size = int(SLURM_CONFIG['MaxArraySize']) - 1
 
     print('Number of segments:', n_segments, flush=True)
     print('max_array_size:', max_array_size, flush=True)
@@ -371,8 +468,6 @@ def main():
 
         # merge Bowtie outputs into a uint8 vector for each chromosome
         wait_to_submit()
-        if kmer == 50:
-            continue
         jobname = f"unify_bowtie_{kmer}"
         jobids[('unify_bowtie', kmer)] = submit_job(
             str(PATH_CONDA_SBATCH),
@@ -390,6 +485,10 @@ def main():
         )
 
     # Combines mappability uint8 vectors of differet kmer values into 1 uint8 vector per chromosome.
+    # make the output directory first to prevent race conditions (each of the jobs will also try to
+    # create the directory if it does not exist)
+    dir_out.joinpath('kmers', 'globalmap').mkdir(exist_ok=True)
+    time.sleep(5)
     jobids['combine_umaps'] = submit_job(
         str(PATH_CONDA_SBATCH),
         str(CONDA_PREFIX),
